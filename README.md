@@ -4,6 +4,8 @@
 
 插件只使用 Python 标准库实现文字搜索，不依赖 `requests`、`httpx`、`openai` 或 `bs4`，适合最小化运行容器和无法动态安装依赖的环境。以图搜图部分依赖 `playwright` 与 Chromium（见下文依赖说明）。
 
+> 本项目是基于 [Akiyo-dayo/nekro-plugin-starseeker-search](https://github.com/Akiyo-dayo/nekro-plugin-starseeker-search) 的改良版，感谢原作者的工作。主要改进集中在以图搜图：百度识图跟进详情页提取真实来源、trace.moe 噪音过滤、Chromium 自动定位与容器重建自动恢复。
+
 ## 功能
 
 - 为 Agent 提供 `web_search` 沙箱方法。
