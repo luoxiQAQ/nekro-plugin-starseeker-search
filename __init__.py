@@ -1643,7 +1643,7 @@ async def image_search_command(
             break
 
     if not image_file_path:
-        return CmdCtl.failed("最近的消息中没有找到图片，请先发送一张图片再使用 /搜图")
+        yield CmdCtl.failed("最近的消息中没有找到图片，请先发送一张图片再使用 /搜图")
 
     loop = asyncio.get_running_loop()
     try:
@@ -1651,7 +1651,7 @@ async def image_search_command(
             None, _read_image_file, image_file_path
         )
     except SearchError as exc:
-        return CmdCtl.failed("读取图片失败: " + str(exc))
+        yield CmdCtl.failed("读取图片失败: " + str(exc))
 
     yield CmdCtl.message("正在搜图，请稍候...")
     results, errors = await loop.run_in_executor(
