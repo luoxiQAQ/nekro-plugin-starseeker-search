@@ -1591,14 +1591,14 @@ async def image_search(
 
 @plugin.mount_on_user_message()
 async def on_user_message(ctx: AgentCtx, message):
-    """拦截 /搜图 指令，从当前消息中提取图片并执行以图搜图"""
+    """拦截 搜图 指令，从当前消息中提取图片并执行以图搜图"""
     from nekro_agent.schemas.chat_message import ChatMessageSegmentImage
     from nekro_agent.schemas.signal import MsgSignal
     from nekro_agent.services.chat.universal_chat_service import universal_chat_service
     from nekro_agent.tools.path_convertor import convert_filename_to_access_path
 
     text = (message.content_text or "").strip()
-    if not text.startswith("/搜图") and not text.startswith("/soutu"):
+    if not text.startswith("搜图") and not text.startswith("soutu"):
         return None
 
     parts = text.split(None, 1)
@@ -1620,7 +1620,7 @@ async def on_user_message(ctx: AgentCtx, message):
     if not image_file_path:
         await universal_chat_service.send_operation_message(
             chat_key=message.chat_key,
-            message="当前消息中没有图片，请在发送 /搜图 时附带一张图片。",
+            message="当前消息中没有图片，请在发送 搜图 时附带一张图片。",
         )
         return MsgSignal.BLOCK_ALL
 
