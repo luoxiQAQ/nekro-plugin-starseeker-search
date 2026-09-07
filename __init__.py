@@ -18,9 +18,18 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 
-from nekro_agent.api.plugin import ConfigBase, NekroPlugin, SandboxMethodType
+from nekro_agent.api.plugin import (
+    Arg,
+    CmdCtl,
+    CommandExecutionContext,
+    CommandPermission,
+    CommandResponse,
+    ConfigBase,
+    NekroPlugin,
+    SandboxMethodType,
+)
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.core import logger
 from pydantic import Field
@@ -1587,6 +1596,69 @@ async def image_search(
     )
 
     return _format_image_results(results, errors)
+
+
+
+@plugin.mount_command(
+    name="soutu",
+    description="以图搜图：对最近一条图片消息进行搜图",
+    aliases=["搜图", "reverse_image"],
+    permission=CommandPermission.PUBLIC,
+    usage="搜图 [max_results]",
+    category="search",
+    tags=["image", "search", "reverse"],
+)
+async def image_search_command(
+    context: CommandExecutionContext,
+    max_results: Annotated[int, Arg("返回结果数量", positional=True)] = 0,
+) -> CommandResponse:
+    """在最近的聊天记录中找到图片并执行以图搜图"""
+    from nekro_agent.models.db_chat_message import DBChatMessage
+    from nekro_agent.schemas.chat_message import ChatMessageSegmentImage, segments_from_list
+    from nekro_agent.tools.path_convertor import convert_filename_to_access_path
+
+    import json5
+    from typing import cast, List, Dict
+
+    limit = max_results if max_results > 0 else config.IMAGE_SEARCH_MAX_RESULTS
+    limit = max(1, min(limit, 10))
+
+    recent_msgs = await DBChatMessage.filter(
+        chat_key=context.chat_key,
+    ).order_by("-send_timestamp").limit(20)
+
+    image_file_path = None
+    for msg in recent_msgs:
+        try:
+            segs = segments_from_list(cast(List[Dict], json5.loads(msg.content_data)))
+            for seg in segs:
+                if isinstance(seg, ChatMessageSegmentImage) and seg.file_name:
+                    image_file_path = str(
+                        convert_filename_to_access_path(seg.file_name, context.chat_key)
+                    )
+                    break
+        except Exception:
+            continue
+        if image_file_path:
+            break
+
+    if not image_file_path:
+        return CmdCtl.failed("最近的消息中没有找到图片，请先发送一张图片再使用 /搜图")
+
+    loop = asyncio.get_running_loop()
+    try:
+        image_data, fname = await loop.run_in_executor(
+            None, _read_image_file, image_file_path
+        )
+    except SearchError as exc:
+        return CmdCtl.failed("读取图片失败: " + str(exc))
+
+    yield CmdCtl.message("正在搜图，请稍候...")
+    results, errors = await loop.run_in_executor(
+        None, _run_image_search, image_data, fname, limit
+    )
+
+    yield CmdCtl.success(_format_image_results(results, errors))
 
 
 @plugin.mount_cleanup_method()
