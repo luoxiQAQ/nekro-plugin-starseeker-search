@@ -90,12 +90,14 @@ image_search(image_path: str, max_results: int = 3) -> str
 
 以图搜图按引擎顺序执行，`IMAGE_SEARCH_PROVIDER=auto` 时依次尝试：
 
-1. **SauceNAO** — 动漫图站聚合（Pixiv / Danbooru / Twitter 等），对 P 站等海外图站命中率高；最高相似度 ≥ 85% 时直接采用，不再继续其他引擎。
+1. **SauceNAO** — 动漫图站聚合（Pixiv / Danbooru / Twitter 等），对 P 站等海外图站命中率高。通过 headless 浏览器访问官网并上传图片抓取结果（绕过 Cloudflare），最高相似度 ≥ 85% 时直接采用，不再继续其他引擎。
 2. **IQDB** — 多 booru 站聚合，无 key 抓取。
 3. **trace.moe** — 动画截图识别（番剧 + 集数 + 时间点）。对非动画截图会返回大量 70-80% 的近似噪音，因此相似度门槛最低取 85%。
 4. **百度识图** — 通过浏览器上传 `graph.baidu.com`，擅长识别国内画师作品和角色。插件会跟进"相似图片"详情页，提取精确的识别结论（"图中可能是XXX"）和微博、抖音、百家号等真实来源页链接。
 
 各引擎结果合并时，百度识图的识别结论与来源页保底收录并排在最前，避免被其他引擎的低置信度结果挤出返回列表；剩余名额按相似度降序补足。这个策略让国内图片优先呈现百度的识别与出处，海外图站图片由 SauceNAO 高置信命中直接收口。
+
+已知局限：SauceNAO 与百度识图基于页面抓取实现，依赖目标站点的页面结构，站点改版可能导致解析退化或结果减少（插件会在错误列表中提示引擎异常）；trace.moe 走官方接口，相对最稳定。另外 SauceNAO 与百度的索引均不覆盖微博、小红书等国内平台的原帖，国内内容依赖百度识图的识别与来源页。
 
 ### 依赖
 
@@ -105,6 +107,8 @@ image_search(image_path: str, max_results: int = 3) -> str
 - Chromium 浏览器二进制。Debian 系容器可用 `apt-get install chromium`；或使用 `playwright install chromium` 安装 Playwright 自带浏览器。
 
 插件会自动按以下顺序定位浏览器：Playwright 自带浏览器路径（受 `PLAYWRIGHT_BROWSERS_PATH` 影响）→ `/usr/bin/chromium` → `/usr/bin/chromium-browser` → `/usr/bin/google-chrome` → `/opt/google/chrome/chrome`。
+
+> 注意：新版 Playwright 的 `playwright install chromium` 已不支持 Debian 11（bullseye）基底容器，会报 `Playwright does not support chromium on debian11-x64`。此类容器请改用发行版软件源安装：`apt-get install chromium`。Debian 12 及以上基底两种方式均可。
 
 容器重建后浏览器容易丢失，建议在容器 entrypoint 中加入自动安装，例如：
 
@@ -123,7 +127,7 @@ fi
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `IMAGE_SEARCH_PROVIDER` | `auto` | 搜图引擎。支持 `auto`、`saucenao`、`iqdb`、`tracemoe`、`baidu`。 |
-| `SAUCENAO_API_KEY` | 空 | SauceNAO API key，https://saucenao.com/user.php 注册获取（免费 200 次/天）。未配置时插件仍会通过浏览器抓取 SauceNAO 页面。 |
+| `SAUCENAO_API_KEY` | 空 | 预留字段。当前版本的 SauceNAO 搜索始终通过浏览器抓取官网页面完成，不调用官方 API，此字段填写与否不影响行为。 |
 | `IMAGE_SEARCH_MIN_SIMILARITY` | `55.0` | 相似度过滤门槛（%），低于该值的结果被丢弃。trace.moe 实际门槛不低于 85%。 |
 | `IMAGE_SEARCH_MAX_RESULTS` | `3` | 默认返回结果数量，范围 `1-10`。 |
 
@@ -195,7 +199,7 @@ image_search(image_path="/app/shared/received_image.jpg")
 说明容器内缺少以图搜图依赖。检查：
 
 1. Nekro Agent 运行环境能否 `import playwright`，不能则 `uv pip install playwright`。
-2. 容器内是否有 Chromium：`ls /usr/bin/chromium`，没有则 `apt-get install chromium` 或 `playwright install chromium`。
+2. 容器内是否有 Chromium：`ls /usr/bin/chromium`，没有则 `apt-get install chromium`（Debian 11 基底）或 `playwright install chromium`（Debian 12+ 基底）。
 3. 容器重建后依赖会丢失，建议把自动安装写入 entrypoint（见上文依赖一节）。
 
 ### 国内图片搜不到或结果不准
