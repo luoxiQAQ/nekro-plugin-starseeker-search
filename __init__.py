@@ -1596,6 +1596,7 @@ async def image_search(
 )
 async def search_image_command(context):
     import time as _time
+    import pathlib
     from nekro_agent.services.command.ctl import CmdCtl
     from nekro_agent.core.os_env import USER_UPLOAD_DIR
     from nekro_agent.tools.path_convertor import sanitize_chat_key_for_path
