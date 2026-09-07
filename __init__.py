@@ -18,18 +18,9 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Annotated, Any
+from typing import Any
 
-from nekro_agent.api.plugin import (
-    Arg,
-    CmdCtl,
-    CommandExecutionContext,
-    CommandPermission,
-    CommandResponse,
-    ConfigBase,
-    NekroPlugin,
-    SandboxMethodType,
-)
+from nekro_agent.api.plugin import ConfigBase, NekroPlugin, SandboxMethodType
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.core import logger
 from pydantic import Field
@@ -1598,52 +1589,40 @@ async def image_search(
     return _format_image_results(results, errors)
 
 
-
-@plugin.mount_command(
-    name="soutu",
-    description="以图搜图：对最近一条图片消息进行搜图",
-    aliases=["搜图", "reverse_image"],
-    permission=CommandPermission.PUBLIC,
-    usage="搜图 [max_results]",
-    category="search",
-    tags=["image", "search", "reverse"],
-)
-async def image_search_command(
-    context: CommandExecutionContext,
-    max_results: Annotated[int, Arg("返回结果数量", positional=True)] = 0,
-) -> CommandResponse:
-    """在最近的聊天记录中找到图片并执行以图搜图"""
-    from nekro_agent.models.db_chat_message import DBChatMessage
-    from nekro_agent.schemas.chat_message import ChatMessageSegmentImage, segments_from_list
+@plugin.mount_on_user_message()
+async def on_user_message(ctx: AgentCtx, message):
+    """拦截 /搜图 指令，从当前消息中提取图片并执行以图搜图"""
+    from nekro_agent.schemas.chat_message import ChatMessageSegmentImage
+    from nekro_agent.schemas.signal import MsgSignal
+    from nekro_agent.services.chat.universal_chat_service import universal_chat_service
     from nekro_agent.tools.path_convertor import convert_filename_to_access_path
 
-    import json5
-    from typing import cast, List, Dict
+    text = (message.content_text or "").strip()
+    if not text.startswith("/搜图") and not text.startswith("/soutu"):
+        return None
 
-    limit = max_results if max_results > 0 else config.IMAGE_SEARCH_MAX_RESULTS
-    limit = max(1, min(limit, 10))
-
-    recent_msgs = await DBChatMessage.filter(
-        chat_key=context.chat_key,
-    ).order_by("-send_timestamp").limit(20)
+    parts = text.split(None, 1)
+    limit = config.IMAGE_SEARCH_MAX_RESULTS
+    if len(parts) > 1:
+        try:
+            limit = max(1, min(int(parts[1]), 10))
+        except ValueError:
+            pass
 
     image_file_path = None
-    for msg in recent_msgs:
-        try:
-            segs = segments_from_list(cast(List[Dict], json5.loads(msg.content_data)))
-            for seg in segs:
-                if isinstance(seg, ChatMessageSegmentImage) and seg.file_name:
-                    image_file_path = str(
-                        convert_filename_to_access_path(seg.file_name, context.chat_key)
-                    )
-                    break
-        except Exception:
-            continue
-        if image_file_path:
+    for seg in message.content_data:
+        if isinstance(seg, ChatMessageSegmentImage) and seg.file_name:
+            image_file_path = str(
+                convert_filename_to_access_path(seg.file_name, message.chat_key)
+            )
             break
 
     if not image_file_path:
-        yield CmdCtl.failed("最近的消息中没有找到图片，请先发送一张图片再使用 /搜图")
+        await universal_chat_service.send_operation_message(
+            chat_key=message.chat_key,
+            message="当前消息中没有图片，请在发送 /搜图 时附带一张图片。",
+        )
+        return MsgSignal.BLOCK_ALL
 
     loop = asyncio.get_running_loop()
     try:
@@ -1651,14 +1630,28 @@ async def image_search_command(
             None, _read_image_file, image_file_path
         )
     except SearchError as exc:
-        yield CmdCtl.failed("读取图片失败: " + str(exc))
+        await universal_chat_service.send_operation_message(
+            chat_key=message.chat_key,
+            message="读取图片失败: " + str(exc),
+        )
+        return MsgSignal.BLOCK_ALL
 
-    yield CmdCtl.message("正在搜图，请稍候...")
+    await universal_chat_service.send_operation_message(
+        chat_key=message.chat_key,
+        message="正在搜图，请稍候...",
+    )
+
     results, errors = await loop.run_in_executor(
         None, _run_image_search, image_data, fname, limit
     )
 
-    yield CmdCtl.success(_format_image_results(results, errors))
+    result_text = _format_image_results(results, errors)
+    await universal_chat_service.send_operation_message(
+        chat_key=message.chat_key,
+        message=result_text,
+    )
+
+    return MsgSignal.BLOCK_ALL
 
 
 @plugin.mount_cleanup_method()
