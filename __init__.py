@@ -1589,69 +1589,51 @@ async def image_search(
     return _format_image_results(results, errors)
 
 
-@plugin.mount_on_user_message()
-async def on_user_message(ctx: AgentCtx, message):
-    """拦截 搜图 指令，从当前消息中提取图片并执行以图搜图"""
-    from nekro_agent.schemas.chat_message import ChatMessageSegmentImage
-    from nekro_agent.schemas.signal import MsgSignal
-    from nekro_agent.services.chat.universal_chat_service import universal_chat_service
-    from nekro_agent.tools.path_convertor import convert_filename_to_access_path
+@plugin.mount_command(
+    name="搜图",
+    description="以图搜图：发送此命令时附带一张图片，自动搜索图片来源",
+    aliases=["soutu", "以图搜图"],
+)
+async def search_image_command(context):
+    import time as _time
+    from nekro_agent.services.command.ctl import CmdCtl
+    from nekro_agent.core.os_env import USER_UPLOAD_DIR
+    from nekro_agent.tools.path_convertor import sanitize_chat_key_for_path
 
-    text = (message.content_text or "").strip()
-    if not text.startswith("搜图") and not text.startswith("soutu"):
-        return None
+    chat_key = context.chat_key
+    upload_dir = pathlib.Path(USER_UPLOAD_DIR) / sanitize_chat_key_for_path(chat_key)
 
-    parts = text.split(None, 1)
-    limit = config.IMAGE_SEARCH_MAX_RESULTS
-    if len(parts) > 1:
-        try:
-            limit = max(1, min(int(parts[1]), 10))
-        except ValueError:
-            pass
+    if not upload_dir.is_dir():
+        yield CmdCtl.error("当前消息中没有图片，请在发送 /搜图 时附带一张图片。")
+        return
 
-    image_file_path = None
-    for seg in message.content_data:
-        if isinstance(seg, ChatMessageSegmentImage) and seg.file_name:
-            image_file_path = str(
-                convert_filename_to_access_path(seg.file_name, message.chat_key)
-            )
-            break
+    now = _time.time()
+    image_exts = ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp')
+    candidates = []
+    for f in upload_dir.iterdir():
+        if f.is_file() and f.suffix.lower() in image_exts:
+            mtime = f.stat().st_mtime
+            if now - mtime < 15:
+                candidates.append((mtime, f))
 
-    if not image_file_path:
-        await universal_chat_service.send_operation_message(
-            chat_key=message.chat_key,
-            message="当前消息中没有图片，请在发送 搜图 时附带一张图片。",
-        )
-        return MsgSignal.BLOCK_ALL
+    if not candidates:
+        yield CmdCtl.error("当前消息中没有图片，请在发送 /搜图 时附带一张图片。")
+        return
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    image_path = str(candidates[0][1])
+
+    yield CmdCtl.message("正在搜图，请稍候...")
 
     loop = asyncio.get_running_loop()
     try:
-        image_data, fname = await loop.run_in_executor(
-            None, _read_image_file, image_file_path
-        )
+        image_data, fname = await loop.run_in_executor(None, _read_image_file, image_path)
     except SearchError as exc:
-        await universal_chat_service.send_operation_message(
-            chat_key=message.chat_key,
-            message="读取图片失败: " + str(exc),
-        )
-        return MsgSignal.BLOCK_ALL
+        yield CmdCtl.error("读取图片失败: " + str(exc))
+        return
 
-    await universal_chat_service.send_operation_message(
-        chat_key=message.chat_key,
-        message="正在搜图，请稍候...",
-    )
-
-    results, errors = await loop.run_in_executor(
-        None, _run_image_search, image_data, fname, limit
-    )
-
-    result_text = _format_image_results(results, errors)
-    await universal_chat_service.send_operation_message(
-        chat_key=message.chat_key,
-        message=result_text,
-    )
-
-    return MsgSignal.BLOCK_ALL
+    results, errors = await loop.run_in_executor(None, _run_image_search, image_data, fname, config.IMAGE_SEARCH_MAX_RESULTS)
+    yield CmdCtl.success(_format_image_results(results, errors))
 
 
 @plugin.mount_cleanup_method()
