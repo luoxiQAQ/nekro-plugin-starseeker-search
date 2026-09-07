@@ -1,4 +1,4 @@
-﻿"""Starseeker Search plugin for Nekro Agent.
+"""Starseeker Search plugin for Nekro Agent.
 
 The plugin intentionally uses only Python's standard library so it can run in
 minimal Nekro Agent containers without installing dynamic dependencies.
@@ -7,12 +7,15 @@ minimal Nekro Agent containers without installing dynamic dependencies.
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import json
+import os
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Any
@@ -26,10 +29,10 @@ from pydantic import Field
 plugin = NekroPlugin(
     name="星巡搜索",
     module_name="nekro_plugin_starseeker_search",
-    description="像巡航星图一样为 Agent 探索互联网，支持 Brave、Tavily、SearXNG 与零配置 fallback。",
-    version="0.1.2",
+    description="像巡航星图一样为 Agent 探索互联网，支持文字搜索与以图搜图。",
+    version="0.2.5",
     author="Akiyo_Codex",
-    url="https://github.com/Akiyo-dayo/nekro-plugin-starseeker-search",
+    url="https://github.com/luoxiQAQ/nekro-plugin-starseeker-search",
 )
 
 
@@ -63,6 +66,30 @@ class StarseekerSearchConfig(ConfigBase):
         default=True,
         title="允许无 Key 兜底",
         description="没有正式 API 配置或正式 API 失败时，允许使用无 Key 搜索源兜底。",
+    )
+    # ---------- 以图搜图配置 ----------
+    IMAGE_SEARCH_PROVIDER: str = Field(
+        default="auto",
+        title="图片搜索服务",
+        description="auto / saucenao / iqdb / tracemoe。auto 按可用配置依次尝试。",
+    )
+    SAUCENAO_API_KEY: str = Field(
+        default="",
+        title="SauceNAO API Key",
+        description="SauceNAO 搜图 API Key，https://saucenao.com/user.php 注册获取（免费 200 次/天）。",
+    )
+    IMAGE_SEARCH_MIN_SIMILARITY: float = Field(
+        default=55.0,
+        title="搜图最低相似度",
+        description="低于此相似度的结果将被过滤（0-100），仅对提供相似度的引擎生效。",
+        ge=0.0,
+        le=100.0,
+    )
+    IMAGE_SEARCH_MAX_RESULTS: int = Field(
+        default=3,
+        title="搜图默认结果数",
+        ge=1,
+        le=10,
     )
 
 
@@ -689,6 +716,877 @@ async def web_search(_ctx: AgentCtx, query: str, max_results: int | None = None)
     loop = asyncio.get_running_loop()
     results, errors = await loop.run_in_executor(None, _run_search, query, limit)
     return _format_results(query, results, errors)
+
+
+# ============================================================
+# 以图搜图
+# ============================================================
+
+
+@dataclass
+class ImageSearchResult:
+    """单条图片搜索结果"""
+    title: str
+    url: str
+    similarity: float       # 0-100, 0 表示引擎未提供
+    author: str
+    source_site: str
+    extra_info: str
+    engine: str
+
+
+def _build_multipart_body(
+    image_data: bytes,
+    filename: str,
+    fields: dict[str, str],
+    file_field_name: str = "file",
+) -> tuple[bytes, str]:
+    """构建 multipart/form-data 请求体（纯标准库）"""
+    boundary = "----StarSeekerImg" + uuid.uuid4().hex
+    parts: list[bytes] = []
+
+    for key, value in fields.items():
+        parts.append(
+            ("--" + boundary + "\r\n"
+             "Content-Disposition: form-data; name=\"" + key + "\"\r\n\r\n"
+             + value + "\r\n").encode("utf-8")
+        )
+
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "jpg"
+    mime_map = {
+        "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+        "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
+    }
+    mime = mime_map.get(ext, "application/octet-stream")
+
+    parts.append(
+        ("--" + boundary + "\r\n"
+         "Content-Disposition: form-data; name=\"" + file_field_name + "\"; "
+         "filename=\"" + filename + "\"\r\n"
+         "Content-Type: " + mime + "\r\n\r\n").encode("utf-8")
+    )
+    parts.append(image_data)
+    parts.append(b"\r\n")
+    parts.append(("--" + boundary + "--\r\n").encode("utf-8"))
+
+    content_type = "multipart/form-data; boundary=" + boundary
+    return b"".join(parts), content_type
+
+
+# -------------------- SauceNAO --------------------
+
+_SAUCENAO_SITE_KEYWORDS = {
+    "pixiv": "Pixiv", "danbooru": "Danbooru", "gelbooru": "Gelbooru",
+    "yande.re": "Yande.re", "konachan": "Konachan", "twitter": "Twitter/X",
+    "deviantart": "DeviantArt", "artstation": "ArtStation", "nijie": "Nijie",
+    "pawoo": "Pawoo", "seiga": "Niconico Seiga", "mangadex": "MangaDex",
+    "e-hentai": "E-Hentai", "anime": "Anime", "anidb": "AniDB",
+    "sankaku": "Sankaku", "bcy": "半次元",
+}
+
+
+def _parse_saucenao_index(index_name: str) -> str:
+    name_lower = index_name.lower()
+    for keyword, site in _SAUCENAO_SITE_KEYWORDS.items():
+        if keyword in name_lower:
+            return site
+    return index_name.split(" - ")[0].strip() if " - " in index_name else "其他"
+
+
+def _find_chromium(pw: Any) -> str:
+    """定位可用的 Chromium：优先 Playwright 自带浏览器（受 PLAYWRIGHT_BROWSERS_PATH 影响），
+    再退回系统常见安装路径。容器镜像更新或重建后浏览器位置可能变化，不能写死一个路径。"""
+    candidates: list[str] = []
+    try:
+        candidates.append(pw.chromium.executable_path)
+    except Exception:
+        pass
+    candidates += [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/opt/google/chrome/chrome",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    raise SearchError(
+        "未找到 Chromium 浏览器（已尝试 Playwright 自带路径与系统常见路径），"
+        "请运行 playwright install chromium 安装"
+    )
+
+
+def _search_saucenao(
+    image_data: bytes,
+    filename: str,
+    limit: int,
+    min_similarity: float,
+    timeout: int,
+) -> list[ImageSearchResult]:
+    """SauceNAO 以图搜图（通过 Playwright 浏览器绕过 Cloudflare）"""
+    import tempfile
+
+    # 将图片写入临时文件供浏览器上传
+    suffix = "." + (filename.rsplit(".", 1)[-1] if "." in filename else "jpg")
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    try:
+        tmp.write(image_data)
+        tmp.flush()
+        tmp.close()
+        tmp_path = tmp.name
+
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            raise SearchError("SauceNAO 需要 playwright，请运行 pip install playwright && apt install chromium")
+
+        with sync_playwright() as pw:
+            chromium_path = _find_chromium(pw)
+            browser = pw.chromium.launch(
+                executable_path=chromium_path,
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            try:
+                ctx = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.6099.224 Safari/537.36"
+                    ),
+                    locale="zh-CN",
+                )
+                page = ctx.new_page()
+                page.set_default_timeout(timeout * 1000)
+
+                # 访问 SauceNAO 首页（过 Cloudflare）
+                page.goto("https://saucenao.com/", timeout=timeout * 1000)
+                page.wait_for_timeout(2000)
+
+                title = page.title().lower()
+                if "just a moment" in title or "challenge" in title:
+                    page.wait_for_timeout(8000)
+                    title = page.title().lower()
+                    if "just a moment" in title:
+                        raise SearchError("SauceNAO Cloudflare 验证未通过")
+
+                # 上传图片
+                file_inputs = page.query_selector_all('input[type="file"]')
+                if not file_inputs:
+                    raise SearchError("SauceNAO 页面未找到上传控件")
+
+                file_inputs[0].set_input_files(tmp_path)
+                submit = page.query_selector('input[type="submit"]')
+                if not submit:
+                    raise SearchError("SauceNAO 页面未找到提交按钮")
+
+                submit.click()
+                page.wait_for_load_state("domcontentloaded", timeout=timeout * 1000)
+                page.wait_for_timeout(3000)
+
+                content = page.content()
+            finally:
+                browser.close()
+
+        # ---- 解析 HTML 结果 ----
+        results: list[ImageSearchResult] = []
+
+        # 提取每个结果块的相似度
+        sims = re.findall(
+            r'<div class="resultsimilarityinfo">(\d+\.\d+)%</div>',
+            content,
+        )
+        # 提取每个结果的内容块
+        blocks = re.findall(
+            r'<td class="resulttablecontent">(.*?)</td>',
+            content,
+            flags=re.S,
+        )
+
+        for idx, block in enumerate(blocks):
+            similarity = float(sims[idx]) if idx < len(sims) else 0.0
+            if similarity < min_similarity:
+                continue
+
+            # 标题
+            title_m = re.search(
+                r'<div class="resulttitle"[^>]*>(.*?)</div>', block, re.S
+            )
+            title = re.sub(r'<[^>]+>', '', title_m.group(1)).strip() if title_m else ""
+
+            # 内容列（作者、来源等）
+            col_m = re.search(
+                r'<div class="resultcontentcolumn">(.*?)</div>', block, re.S
+            )
+            col_text = ""
+            if col_m:
+                col_text = re.sub(r'<[^>]+>', ' ', col_m.group(1)).strip()
+                col_text = re.sub(r'\s+', ' ', col_text)
+
+            # 作者提取
+            author = ""
+            author_patterns = [
+                r'(?:Member|Author|Creator|Artist)[:\s]+([^\n<]+)',
+                r'(?:画师|作者)[:\s]+([^\n<]+)',
+            ]
+            for ap in author_patterns:
+                am = re.search(ap, col_text, re.I)
+                if am:
+                    author = am.group(1).strip()
+                    break
+
+            # 来源链接（排除 saucenao 自身链接）
+            links = re.findall(
+                r'href="(https?://(?!saucenao)[^"]+)"', block
+            )
+            source_url = ""
+            source_site = "其他"
+            for link in links:
+                link_clean = link.replace("&amp;", "&")
+                link_lower = link_clean.lower()
+                for kw, site in _SAUCENAO_SITE_KEYWORDS.items():
+                    if kw in link_lower:
+                        source_site = site
+                        source_url = link_clean
+                        break
+                if source_url:
+                    break
+
+            if not source_url and links:
+                source_url = links[0].replace("&amp;", "&")
+
+            results.append(ImageSearchResult(
+                title=title or "(无标题)",
+                url=source_url,
+                similarity=similarity,
+                author=author or "(未知作者)",
+                source_site=source_site,
+                extra_info="",
+                engine="SauceNAO",
+            ))
+
+        results.sort(key=lambda r: r.similarity, reverse=True)
+        return results[:limit]
+
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+# -------------------- IQDB --------------------
+
+def _search_iqdb(
+    image_data: bytes,
+    filename: str,
+    limit: int,
+    min_similarity: float,
+    timeout: int,
+) -> list[ImageSearchResult]:
+    """IQDB 以图搜图（多 booru 站聚合）"""
+    body, content_type = _build_multipart_body(image_data, filename, {})
+
+    request = urllib.request.Request(
+        "https://iqdb.org/",
+        data=body,
+        headers={
+            "Content-Type": content_type,
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+            ),
+            "Referer": "https://iqdb.org/",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            page = response.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        raise SearchError("IQDB 请求失败: " + str(exc)) from exc
+
+    if "Just a moment" in page:
+        raise SearchError("IQDB 被 Cloudflare 拦截")
+
+    # IQDB 结果结构：每个匹配在 <table> 中，有相似度百分比和来源链接
+    # 结果块之间用 <div> 或 <table> 分隔
+    results: list[ImageSearchResult] = []
+
+    # 找到所有包含相似度的结果块
+    # IQDB 格式: "<td>NN% similarity</td>" 和来源链接
+    result_tables = re.findall(
+        r'<table[^>]*>(.*?)</table>',
+        page,
+        flags=re.S,
+    )
+
+    for table in result_tables:
+        sim_match = re.search(r'(\d+)% similarity', table)
+        if not sim_match:
+            continue
+
+        similarity = float(sim_match.group(1))
+        if similarity < min_similarity:
+            continue
+
+        # 提取来源链接（各 booru 站）
+        link_matches = re.findall(
+            r'<a[^>]+href="(https?://[^"]+)"[^>]*>',
+            table,
+            flags=re.I,
+        )
+
+        source_url = ""
+        source_site = "其他"
+        for link in link_matches:
+            if any(d in link.lower() for d in (
+                "danbooru", "yande.re", "gelbooru", "konachan",
+                "anime-pictures", "e-shuushuu", "zerochan",
+                "sankaku",
+            )):
+                source_url = link
+                break
+
+        if not source_url and link_matches:
+            source_url = link_matches[0]
+
+        # 判断来源站点
+        url_lower = source_url.lower()
+        if "danbooru" in url_lower:
+            source_site = "Danbooru"
+        elif "yande.re" in url_lower:
+            source_site = "Yande.re"
+        elif "gelbooru" in url_lower:
+            source_site = "Gelbooru"
+        elif "konachan" in url_lower:
+            source_site = "Konachan"
+        elif "anime-pictures" in url_lower:
+            source_site = "Anime-Pictures"
+        elif "e-shuushuu" in url_lower:
+            source_site = "E-Shuushuu"
+        elif "zerochan" in url_lower:
+            source_site = "Zerochan"
+        elif "sankaku" in url_lower:
+            source_site = "Sankaku"
+
+        # 提取尺寸/分辨率信息
+        res_match = re.search(r'(\d+)[×x](\d+)', table)
+        extra = ""
+        if res_match:
+            extra = res_match.group(1) + "×" + res_match.group(2)
+
+        # 标题（IQDB 通常没有标题，用来源站名代替）
+        title = source_site + " #" + (source_url.rsplit("/", 1)[-1][:20] if "/" in source_url else "?")
+
+        results.append(ImageSearchResult(
+            title=title,
+            url=source_url,
+            similarity=similarity,
+            author="",
+            source_site=source_site,
+            extra_info=extra,
+            engine="IQDB",
+        ))
+
+        if len(results) >= limit:
+            break
+
+    results.sort(key=lambda r: r.similarity, reverse=True)
+    return results[:limit]
+
+
+# -------------------- trace.moe --------------------
+
+def _search_tracemoe(
+    image_data: bytes,
+    filename: str,
+    limit: int,
+    min_similarity: float,
+    timeout: int,
+) -> list[ImageSearchResult]:
+    """trace.moe 动画截图识别"""
+
+    # 使用 multipart 上传（比 base64 支持更大的文件）
+    boundary = "----TraceMoe" + uuid.uuid4().hex
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "jpg"
+    mime_map = {
+        "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+        "gif": "image/gif", "webp": "image/webp",
+    }
+    mime = mime_map.get(ext, "image/jpeg")
+
+    body = b""
+    body += ("--" + boundary + "\r\n").encode()
+    body += ("Content-Disposition: form-data; name=\"image\"; "
+             "filename=\"" + filename + "\"\r\n").encode()
+    body += ("Content-Type: " + mime + "\r\n\r\n").encode()
+    body += image_data
+    body += ("\r\n--" + boundary + "--\r\n").encode()
+
+    request = urllib.request.Request(
+        "https://api.trace.moe/search?anilistInfo&cutBorders",
+        data=body,
+        headers={
+            "Content-Type": "multipart/form-data; boundary=" + boundary,
+            "User-Agent": "StarSeekerSearch/0.2",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 413:
+            raise SearchError("trace.moe: 图片文件过大，请使用较小的图片") from exc
+        raise SearchError("trace.moe HTTP " + str(exc.code)) from exc
+    except Exception as exc:
+        raise SearchError("trace.moe 请求失败: " + str(exc)) from exc
+
+    results: list[ImageSearchResult] = []
+    for item in data.get("result", [])[:limit * 2]:
+        similarity = round(item.get("similarity", 0) * 100, 1)
+        # trace.moe 对非动画截图会返回大量 70-80% 的近似噪音（多部无关番剧同时命中），
+        # 真实命中通常 >= 85%，因此相似度门槛最低取 85
+        effective_min = max(min_similarity, 85.0)
+        if similarity < effective_min:
+            continue
+
+        anilist = item.get("anilist") or {}
+        title_obj = anilist.get("title") or {}
+
+        title = (
+            title_obj.get("native")
+            or title_obj.get("romaji")
+            or title_obj.get("english")
+            or str(item.get("filename", "(未知动画)"))
+        )
+
+        episode = item.get("episode", "?")
+        time_from = item.get("from", 0)
+        minutes = int(time_from) // 60
+        seconds = int(time_from) % 60
+        extra = "第" + str(episode) + "集 " + str(minutes).zfill(2) + ":" + str(seconds).zfill(2)
+
+        anilist_id = anilist.get("id")
+        url = ("https://anilist.co/anime/" + str(anilist_id)) if anilist_id else ""
+
+        results.append(ImageSearchResult(
+            title=title,
+            url=url,
+            similarity=similarity,
+            author="",
+            source_site="AniList",
+            extra_info=extra,
+            engine="trace.moe",
+        ))
+
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+# -------------------- 百度识图 --------------------
+
+# 百度识图结果页里的站内域名与电商域名，提取来源链接时排除
+_BAIDU_INTERNAL_HOSTS = (
+    "baidu.com", "bdstatic.com", "bdimg.com", "bcebos.com", "baidubce.com",
+)
+_BAIDU_SHOPPING_HOSTS = (
+    "jd.com", "3.cn", "taobao.com", "tmall.com", "yangkeduo.com", "pinduoduo.com",
+    "suning.com", "vip.com", "vipshop.com", "dangdang.com", "gome.com.cn",
+    "kaola.com", "mogujie.com", "1688.com", "alibaba.com", "aliexpress.com",
+)
+
+
+def _baidu_host_excluded(host: str) -> bool:
+    """判断域名是否为百度站内链接或电商商品链接"""
+    for domain in _BAIDU_INTERNAL_HOSTS + _BAIDU_SHOPPING_HOSTS:
+        if host == domain or host.endswith("." + domain):
+            return True
+    return False
+
+
+def _collect_baidu_page_hits(page: Any) -> tuple[str, list[tuple[str, str]]]:
+    """从当前百度识图结果页提取 (识别猜测, [(标题, 链接)...])。
+
+    真实来源页是"图片来源"区的外链，按全页 <a href> 过滤"非百度站内、非电商"得到；
+    百家号是内容页不算站内跳转，保留。
+    """
+    body_text = page.inner_text("body")
+    guess_match = re.search(r'图中可能是(.+?)(?:\n|$)', body_text)
+    guess = guess_match.group(1).strip() if guess_match else ""
+
+    hits: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for anchor in page.query_selector_all("a[href]"):
+        href = (anchor.get_attribute("href") or "").strip()
+        if not href.startswith(("http://", "https://")):
+            continue
+        host = urllib.parse.urlparse(href).netloc.lower()
+        if not host or (_baidu_host_excluded(host) and not host.endswith("baijiahao.baidu.com")):
+            continue
+        link_key = href.split("#")[0].split("?")[0]
+        if not link_key or link_key in seen:
+            continue
+        title = (anchor.inner_text() or "").strip()
+        title = title or (anchor.get_attribute("title") or "").strip()
+        if not title:
+            continue
+        seen.add(link_key)
+        hits.append((re.sub(r"\s+", " ", title)[:120], href))
+    return guess, hits
+
+
+def _search_baidu(
+    image_data: bytes,
+    filename: str,
+    limit: int,
+    min_similarity: float,
+    timeout: int,
+) -> list[ImageSearchResult]:
+    """百度识图（通过 Playwright 浏览器），擅长识别国内画师作品和角色。
+
+    结果页结构（2026-09 实测）：识别结论"图中可能是XXX"和"图片来源"外链在
+    主结果页与"相似图片"详情页都有。动漫类图片的主结果页经常两者皆无
+    （相似图片区全是 graph.baidu.com 站内跳转），精确的识别结论和微博/抖音
+    等真实来源页在相似图片详情页里，因此主结果页提取后要跟进前几条详情页。
+    """
+    import tempfile
+    import time
+
+    suffix = "." + (filename.rsplit(".", 1)[-1] if "." in filename else "jpg")
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    try:
+        tmp.write(image_data)
+        tmp.flush()
+        tmp.close()
+        tmp_path = tmp.name
+
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            raise SearchError("百度识图需要 playwright")
+
+        guess = ""
+        source_links: list[tuple[str, str]] = []  # (标题, 链接)
+
+        with sync_playwright() as pw:
+            chromium_path = _find_chromium(pw)
+            browser = pw.chromium.launch(
+                executable_path=chromium_path,
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ],
+            )
+            try:
+                ctx = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.6099.224 Safari/537.36"
+                    ),
+                    locale="zh-CN",
+                )
+                page = ctx.new_page()
+                page.set_default_timeout(timeout * 1000)
+
+                page.goto(
+                    "https://graph.baidu.com/pcpage/index?tpl_from=pc",
+                    wait_until="domcontentloaded",
+                    timeout=timeout * 1000,
+                )
+                page.wait_for_timeout(1500)
+
+                file_inputs = page.query_selector_all('input[type="file"]')
+                if not file_inputs:
+                    raise SearchError("百度识图未找到上传控件")
+
+                file_inputs[0].set_input_files(tmp_path)
+
+                # 上传后页面会跳转到 graph.baidu.com/s? 结果页，
+                # 用 URL 变化作为就绪信号，比固定 sleep 可靠
+                deadline = time.monotonic() + timeout * 2
+                while time.monotonic() < deadline:
+                    if "graph.baidu.com/s" in page.url:
+                        break
+                    page.wait_for_timeout(500)
+                page.wait_for_timeout(2500)  # 等结果卡片渲染完
+
+                guess, source_links = _collect_baidu_page_hits(page)
+                seen_keys = {href.split("#")[0].split("?")[0] for _, href in source_links}
+
+                # 动漫类图片的识别结论和真实来源通常在相似图片详情页，跟进前两条
+                detail_hrefs: list[str] = []
+                for anchor in page.query_selector_all('a[class*="imgcol-item"]'):
+                    href = (anchor.get_attribute("href") or "").strip()
+                    if href.startswith("http") and "graph.baidu.com" in href:
+                        detail_hrefs.append(href)
+                    if len(detail_hrefs) >= 2:
+                        break
+
+                for detail_href in detail_hrefs:
+                    try:
+                        page.goto(
+                            detail_href,
+                            wait_until="domcontentloaded",
+                            timeout=timeout * 1000,
+                        )
+                        page.wait_for_timeout(2500)
+                        detail_guess, detail_hits = _collect_baidu_page_hits(page)
+                        if not guess and detail_guess:
+                            guess = detail_guess
+                        for item in detail_hits:
+                            item_key = item[1].split("#")[0].split("?")[0]
+                            if item_key not in seen_keys:
+                                seen_keys.add(item_key)
+                                source_links.append(item)
+                        if len(source_links) >= max(limit * 2, 4):
+                            break
+                    except Exception:
+                        continue
+            finally:
+                browser.close()
+
+        # ---- 解析结果 ----
+        results: list[ImageSearchResult] = []
+
+        if guess:
+            # 识别结论直接挂第一个真实来源页，Agent 拿到的第一条就是可点击出处；
+            # 没有来源页时才退回关键词搜索链接
+            if source_links:
+                guess_title, guess_url = source_links.pop(0)
+                extra_info = "AI 识别结果；来源: " + guess_title
+            else:
+                guess_url = "https://www.baidu.com/s?wd=" + urllib.parse.quote(guess)
+                extra_info = "AI 识别结果"
+            results.append(ImageSearchResult(
+                title="百度识别: " + guess,
+                url=guess_url,
+                similarity=0,
+                author="",
+                source_site=urllib.parse.urlparse(guess_url).netloc or "百度识图",
+                extra_info=extra_info,
+                engine="百度识图",
+            ))
+
+        for title, href in source_links[: max(limit * 2, 4)]:
+            results.append(ImageSearchResult(
+                title=title,
+                url=href,
+                similarity=0,
+                author="",
+                source_site=urllib.parse.urlparse(href).netloc,
+                extra_info="图片来源",
+                engine="百度识图",
+            ))
+
+        return results[:limit]
+
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+# -------------------- 引擎调度 --------------------
+
+def _read_image_file(host_path: str) -> tuple[bytes, str]:
+    """读取图片文件，返回 (bytes, filename)"""
+    if not os.path.isfile(host_path):
+        raise SearchError("图片文件不存在: " + host_path)
+
+    file_size = os.path.getsize(host_path)
+    if file_size > 20 * 1024 * 1024:
+        raise SearchError("图片文件过大 (" + str(file_size // 1024 // 1024) + "MB)，最大支持 20MB")
+    if file_size == 0:
+        raise SearchError("图片文件为空")
+
+    with open(host_path, "rb") as f:
+        data = f.read()
+
+    return data, os.path.basename(host_path)
+
+
+def _dedup_image_results(items: list[ImageSearchResult]) -> list[ImageSearchResult]:
+    """按 URL 去重（忽略锚点与查询参数），保留首次出现顺序"""
+    seen_urls: set[str] = set()
+    unique: list[ImageSearchResult] = []
+    for r in items:
+        clean_url = r.url.split("#")[0].split("?")[0] if r.url else ""
+        if clean_url and clean_url in seen_urls:
+            continue
+        if clean_url:
+            seen_urls.add(clean_url)
+        unique.append(r)
+    return unique
+
+
+def _run_image_search(
+    image_data: bytes,
+    filename: str,
+    limit: int,
+) -> tuple[list[ImageSearchResult], list[str]]:
+    """按配置的引擎顺序执行图片搜索"""
+    timeout = max(3, min(int(config.TIMEOUT_SECONDS), 60))
+    min_sim = config.IMAGE_SEARCH_MIN_SIMILARITY
+    errors: list[str] = []
+
+    provider = config.IMAGE_SEARCH_PROVIDER.strip().lower()
+
+    if provider == "auto":
+        providers: list[str] = []
+        providers.append("saucenao")
+        providers.append("iqdb")
+        providers.append("tracemoe")
+        providers.append("baidu")
+    elif provider:
+        providers = [provider]
+    else:
+        return [], ["未配置图片搜索引擎"]
+
+    engine_results: list[list[ImageSearchResult]] = []
+
+    for engine in providers:
+        try:
+            if engine == "saucenao":
+                results = _search_saucenao(image_data, filename, limit, min_sim, timeout)
+            elif engine == "iqdb":
+                results = _search_iqdb(image_data, filename, limit, min_sim, timeout)
+            elif engine == "tracemoe":
+                results = _search_tracemoe(image_data, filename, limit, min_sim, timeout)
+            elif engine == "baidu":
+                results = _search_baidu(image_data, filename, limit, min_sim, timeout)
+            else:
+                raise SearchError("未知图片搜索引擎: " + engine)
+
+            if results:
+                # SauceNAO 高置信度命中时直接采用，不再混合其他引擎
+                if engine == "saucenao" and results[0].similarity >= 85:
+                    return _dedup_image_results(results)[:limit], errors
+                engine_results.append(results)
+        except Exception as exc:
+            errors.append(engine + ": " + str(exc))
+            logger.warning("星巡搜索 图片搜索 " + engine + " 失败: " + str(exc))
+
+    if not engine_results:
+        return [], errors
+
+    # 保底收录：百度识图结果（识别结论 + 来源页）取前两条，其他引擎取最佳一条。
+    # 百度识图不返回相似度，若与其他引擎结果统一按相似度排序，
+    # 会把国内图片场景下最可靠的百度结果沉底甚至截掉。
+    reserved: list[ImageSearchResult] = []
+    rest: list[ImageSearchResult] = []
+    for results in engine_results:
+        if results[0].engine == "百度识图":
+            reserved.extend(results[:2])
+            rest.extend(results[2:])
+        else:
+            reserved.append(results[0])
+            rest.extend(results[1:])
+
+    # 保底名额中百度结果稳定排前，其余引擎按运行顺序跟随
+    reserved.sort(key=lambda r: 0 if r.engine == "百度识图" else 1)
+
+    # 剩余名额按相似度降序补足（百度条目相似度为 0，自然排在保底名额之后）
+    rest.sort(key=lambda r: r.similarity, reverse=True)
+
+    merged = _dedup_image_results(reserved + rest)
+    return merged[:limit], errors
+
+
+def _format_image_results(
+    results: list[ImageSearchResult],
+    errors: list[str],
+) -> str:
+    """格式化图片搜索结果"""
+    if not results:
+        details = "\n".join("- " + e for e in errors[-5:])
+        return ("星巡搜索没有找到相似图片。\n" + details).strip()
+
+    engines = "、".join(dict.fromkeys(r.engine for r in results))
+    lines = ["星巡搜索（以图搜图）结果", "搜索引擎：" + engines]
+    if errors:
+        lines.append("部分引擎异常：" + "；".join(errors[-3:]))
+    lines.append("")
+
+    for i, r in enumerate(results, 1):
+        sim_str = " (" + str(round(r.similarity, 1)) + "%)" if r.similarity > 0 else ""
+        lines.append(str(i) + ". [" + r.source_site + "]" + sim_str + " " + r.title)
+        if r.author and r.author != "(未知作者)":
+            lines.append("   作者：" + r.author)
+        if r.extra_info:
+            lines.append("   信息：" + r.extra_info)
+        if r.url:
+            lines.append("   链接：" + r.url)
+
+    return "\n".join(lines).strip()
+
+
+@plugin.mount_sandbox_method(
+    SandboxMethodType.AGENT,
+    name="image_search",
+    description="以图搜图：搜索图片的来源、原作者和出处链接。当用户发送图片并请求搜索来源/出处/作者/原图时调用。支持 SauceNAO(Pixiv/DeviantArt/Twitter等)、IQDB(图站聚合)、trace.moe(动画截图)和百度识图(国内画师/角色识别)。",
+)
+async def image_search(
+    _ctx: AgentCtx,
+    image_path: str,
+    max_results: int | None = None,
+) -> str:
+    """以图搜图，搜索一张图片的来源、原作者和出处链接。
+
+    Args:
+        image_path: 图片的沙箱路径，如 /app/shared/xxx.jpg。
+        max_results: 返回结果数量，默认使用插件配置。
+
+    Returns:
+        包含来源站点、作者、相似度和链接的搜索结果。
+
+    Example:
+        image_search("/app/shared/received_image.jpg")
+    """
+    image_path = (image_path or "").strip()
+    if not image_path:
+        return "星巡搜索需要一个图片路径。"
+
+    limit = max_results if max_results is not None else config.IMAGE_SEARCH_MAX_RESULTS
+    limit = max(1, min(int(limit), 10))
+
+    # 将沙箱路径转换为宿主机路径
+    try:
+        host_path = _ctx.fs.get_file(image_path)
+    except Exception as exc:
+        return "无法访问图片文件: " + str(exc)
+
+    # 读取图片
+    loop = asyncio.get_running_loop()
+    try:
+        image_data, fname = await loop.run_in_executor(
+            None, _read_image_file, str(host_path)
+        )
+    except SearchError as exc:
+        return str(exc)
+
+    # 执行搜索
+    results, errors = await loop.run_in_executor(
+        None, _run_image_search, image_data, fname, limit
+    )
+
+    return _format_image_results(results, errors)
 
 
 @plugin.mount_cleanup_method()
